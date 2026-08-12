@@ -1,0 +1,46 @@
+{
+  "random_forest": {
+    "accuracy": 0.9393,
+    "f1_macro": 0.7785
+  },
+  "xgboost": {
+    "accuracy": 0.9336,
+    "f1_macro": 0.7646
+  },
+  "svm": {
+    "accuracy": 0.8829,
+    "f1_macro": 0.6858
+  },
+  "lstm": {
+    "accuracy": 0.9307,
+    "f1_macro": 0.772
+  },
+  "ensemble": {
+    "accuracy": 0.9414,
+    "f1_macro": 0.786
+  },
+  "feature_columns": [
+    "soil_moisture_pct",
+    "rainfall_1h_mm",
+    "rainfall_24h_mm",
+    "temperature_c",
+    "humidity_pct",
+    "vibration_events_10min",
+    "vibration_events_3h",
+    "tilt_deg",
+    "tilt_delta_3h",
+    "soil_trend_3h"
+  ],
+  "class_names": [
+    "Safe",
+    "Watch",
+    "Warning",
+    "Critical"
+  ],
+  "ensemble_weights": {
+    "rf": 0.27,
+    "xgboost": 0.27,
+    "svm": 0.16,
+    "lstm": 0.3
+  }
+}

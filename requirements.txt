@@ -1,0 +1,22 @@
+# GeoAlert - Python dependencies (all free / open-source, no paid tier required)
+# Install with:  pip install -r requirements.txt
+
+# --- ML training + inference (ml/ and backend/ensemble.py) ---
+numpy==2.4.4
+pandas==3.0.2
+scikit-learn==1.8.0
+xgboost==3.4.0
+tensorflow-cpu==2.21.0      # swap for `tensorflow` if you have a CUDA GPU
+joblib==1.5.3
+
+# --- Backend API (backend/app.py) ---
+flask==3.1.3
+flask-cors==6.0.5
+
+# --- Agentic AI layer (backend/agent.py) ---
+# Free tier: get a key at https://aistudio.google.com/apikey (no credit card)
+google-genai==2.17.0
+
+# --- Dashboard (dashboard/dashboard.py) ---
+streamlit==1.61.1
+requests==2.33.1
