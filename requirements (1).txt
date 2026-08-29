@@ -1,0 +1,261 @@
+"""
+GeoAlert -- PHASE 3: Local Flask Prediction Server (free-stack edition)
+Tool    : plain Python on your own machine (or a free VM later)
+Invoked : by n8n's HTTP Request node (Phase 4), on the SAME machine --
+          this server is never exposed to the public internet at all.
+          The public-facing tunnel in this architecture fronts n8n,
+          not this server; n8n reaches this over plain localhost.
+
+WHY THIS REPLACES AWS LAMBDA:
+Lambda needed a container image (TensorFlow alone blows past the
+250MB zip-deployment limit), S3 downloads on cold start, and
+DynamoDB for the LSTM's rolling window. A long-lived local process
+sidesteps all three: models load once at startup and stay in memory,
+there's no download step since the files are already on disk, and
+the rolling window can live in Firebase Realtime Database -- which,
+unlike DynamoDB's boto3 resource API, accepts plain Python floats
+natively, so there's no Decimal-conversion dance needed either.
+
+WHY IT STILL WORKS BEFORE ANY MODEL HAS EVER BEEN TRAINED:
+Phase 4 (n8n) depends on this server responding to build and test
+the alert pipeline -- but real training data only exists once
+Phase 4 has been live for a while. So: if models/latest/ is empty or
+missing at startup, this falls back to the same domain-knowledge
+heuristic used everywhere else in this project, and logs a clear
+warning rather than crashing. Train later, drop the five files in,
+restart -- it upgrades to the full ensemble automatically.
+
+REQUEST  : POST /predict with the same JSON shape the ESP32 sends --
+           device_id, moisture, rainfall, temperature, humidity,
+           vibration, tilt_x, tilt_y (extra fields are ignored)
+RESPONSE : {"risk_score": 0.12, "zone": "safe",
+            "model_scores": {"rf":..,"xgb":..,"svm":..,"lstm":..},
+            "warmup": false, "mode": "ensemble"}
+"""
+
+import os
+import numpy as np
+import joblib
+import firebase_admin
+from firebase_admin import credentials, db
+from flask import Flask, request, jsonify
+
+# ======================================================================
+#  CONFIG -- fill in FIREBASE_DB_URL before running
+# ======================================================================
+HERE = os.path.dirname(os.path.abspath(__file__))
+MODEL_DIR = os.path.join(HERE, "..", "..", "models", "latest")
+FIREBASE_CRED_PATH = os.path.join(HERE, "firebase_service_account.json")
+
+# Firebase Console -> Realtime Database -> the URL shown at the top
+FIREBASE_DB_URL = "https://YOUR-PROJECT-default-rtdb.asia-southeast1.firebasedatabase.app"
+
+SEQ_LEN = 30   # must match training/train_models.py exactly
+WEIGHTS = {"rf": 0.20, "xgb": 0.30, "svm": 0.15, "lstm": 0.35}
+SAFE_MAX, WATCH_MAX = 0.40, 0.70
+
+# Same order as FEATURE_COLS in training/train_models.py
+FEATURE_ORDER = [
+    "moisture", "rainfall", "temperature", "humidity",
+    "vibration", "tilt_x", "tilt_y",
+    "moisture_roll_avg", "rainfall_roll_avg",
+    "tilt_x_rate", "tilt_y_rate", "moisture_tilt_intr",
+]
+
+# ======================================================================
+#  FIREBASE INIT -- once at process startup
+# ======================================================================
+firebase_admin.initialize_app(
+    credentials.Certificate(FIREBASE_CRED_PATH),
+    {"databaseURL": FIREBASE_DB_URL},
+)
+
+
+# ======================================================================
+#  MODEL LOAD -- once at process startup, not per-request. If any file
+#  is missing (first run, before Colab has ever produced a model),
+#  fall back to the heuristic instead of crashing.
+# ======================================================================
+def try_load_models():
+    required = ["rf_model.pkl", "xgb_model.pkl", "svm_model.pkl",
+                "scaler.pkl", "lstm_model.h5"]
+    missing = [f for f in required if not os.path.exists(os.path.join(MODEL_DIR, f))]
+    if missing:
+        print(f"[STARTUP] No trained models found in {MODEL_DIR} "
+              f"(missing: {missing}).")
+        print("[STARTUP] Starting in HEURISTIC-ONLY mode -- this is "
+              "expected before Phase 3's Colab training has ever been "
+              "run. Train later and restart to upgrade automatically.")
+        return None
+
+    import tensorflow as tf
+    print(f"[STARTUP] Loading models from {MODEL_DIR} ...")
+    models = {
+        "rf":     joblib.load(os.path.join(MODEL_DIR, "rf_model.pkl")),
+        "xgb":    joblib.load(os.path.join(MODEL_DIR, "xgb_model.pkl")),
+        "svm":    joblib.load(os.path.join(MODEL_DIR, "svm_model.pkl")),
+        "scaler": joblib.load(os.path.join(MODEL_DIR, "scaler.pkl")),
+        "lstm":   tf.keras.models.load_model(os.path.join(MODEL_DIR, "lstm_model.h5")),
+    }
+    print("[STARTUP] All 5 artefacts loaded -- running in ENSEMBLE mode")
+    return models
+
+
+MODELS = try_load_models()
+
+app = Flask(__name__)
+
+
+# ======================================================================
+#  FEATURE ENGINEERING -- identical math to training/train_models.py's
+#  pandas rolling()/diff(), computed by hand over a list capped at 30.
+# ======================================================================
+def compute_feature_matrix(raw_history):
+    n = len(raw_history)
+    feats = np.zeros((n, 12), dtype=np.float32)
+    for i in range(n):
+        r = raw_history[i]
+        moisture    = r["moisture"]
+        rainfall    = r["rainfall"]
+        temperature = r["temperature"]
+        humidity    = r["humidity"]
+        vibration   = 1.0 if r.get("vibration") else 0.0
+        tilt_x      = r["tilt_x"]
+        tilt_y      = r["tilt_y"]
+
+        win_start = max(0, i - 4)
+        m_win = [raw_history[j]["moisture"] for j in range(win_start, i + 1)]
+        r_win = [raw_history[j]["rainfall"] for j in range(win_start, i + 1)]
+        moisture_roll = sum(m_win) / len(m_win)
+        rainfall_roll = sum(r_win) / len(r_win)
+
+        if i == 0:
+            tilt_x_rate = 0.0
+            tilt_y_rate = 0.0
+        else:
+            tilt_x_rate = tilt_x - raw_history[i - 1]["tilt_x"]
+            tilt_y_rate = tilt_y - raw_history[i - 1]["tilt_y"]
+
+        moisture_tilt = moisture * (abs(tilt_x) + abs(tilt_y))
+
+        feats[i] = [
+            moisture, rainfall, temperature, humidity, vibration,
+            tilt_x, tilt_y, moisture_roll, rainfall_roll,
+            tilt_x_rate, tilt_y_rate, moisture_tilt,
+        ]
+    return feats
+
+
+# ======================================================================
+#  FALLBACK HEURISTIC -- same rule used everywhere else in this
+#  project (Phase 4's n8n workflow, the IEEE paper's synthetic
+#  labelling). Used only when MODELS is None.
+# ======================================================================
+def local_heuristic(reading):
+    moisture = reading.get("moisture", 0)
+    rainfall = reading.get("rainfall", 0)
+    tilt_x = abs(reading.get("tilt_x", 0))
+    tilt_y = abs(reading.get("tilt_y", 0))
+    vib_count = reading.get("vib_count", 0)
+
+    danger = moisture > 75 and rainfall > 70 and (tilt_x > 8 or tilt_y > 8 or vib_count >= 2)
+    watch = moisture > 55 or rainfall > 50
+
+    score = 0.85 if danger else 0.55 if watch else 0.15
+    zone = "danger" if danger else "watch" if watch else "safe"
+    return score, zone
+
+
+# ======================================================================
+#  /predict
+# ======================================================================
+@app.route("/predict", methods=["POST"])
+def predict():
+    body = request.get_json(force=True, silent=True) or {}
+    device_id = body.get("device_id")
+    if not device_id:
+        return jsonify({"error": "device_id is required"}), 400
+
+    try:
+        reading = {
+            "moisture":    float(body.get("moisture", 0)),
+            "rainfall":    float(body.get("rainfall", 0)),
+            "temperature": float(body.get("temperature", 0)),
+            "humidity":    float(body.get("humidity", 0)),
+            "vibration":   bool(body.get("vibration", False)),
+            "tilt_x":      float(body.get("tilt_x", 0)),
+            "tilt_y":      float(body.get("tilt_y", 0)),
+        }
+    except (TypeError, ValueError):
+        return jsonify({"error": "one or more sensor fields are non-numeric"}), 400
+
+    # Rolling window lives in Realtime Database, not DynamoDB -- and
+    # unlike boto3's DynamoDB resource API, this accepts plain floats
+    # with no Decimal conversion needed.
+    ref = db.reference(f"/sequences/{device_id}")
+    history = ref.get() or []
+    history.append(reading)
+    history = history[-SEQ_LEN:]
+    ref.set(history)
+
+    if MODELS is None:
+        score, zone = local_heuristic({**reading, "vib_count": body.get("vib_count", 0)})
+        return jsonify({
+            "risk_score": round(score, 4),
+            "zone": zone,
+            "model_scores": {"fallback_heuristic": round(score, 4)},
+            "warmup": len(history) < SEQ_LEN,
+            "mode": "heuristic",
+        }), 200
+
+    feat_matrix = compute_feature_matrix(history)
+    latest_scaled = MODELS["scaler"].transform(feat_matrix[-1:])
+
+    warmup = len(history) < SEQ_LEN
+    if warmup:
+        pad = np.repeat(feat_matrix[:1], SEQ_LEN - len(history), axis=0)
+        seq_raw = np.vstack([pad, feat_matrix])
+    else:
+        seq_raw = feat_matrix
+    seq_scaled = MODELS["scaler"].transform(seq_raw).reshape(1, SEQ_LEN, -1)
+
+    p_rf   = float(MODELS["rf"].predict_proba(latest_scaled)[0, 1])
+    p_xgb  = float(MODELS["xgb"].predict_proba(latest_scaled)[0, 1])
+    p_svm  = float(MODELS["svm"].predict_proba(latest_scaled)[0, 1])
+    p_lstm = float(MODELS["lstm"].predict(seq_scaled, verbose=0)[0, 0])
+
+    risk_score = (
+        WEIGHTS["rf"] * p_rf + WEIGHTS["xgb"] * p_xgb +
+        WEIGHTS["svm"] * p_svm + WEIGHTS["lstm"] * p_lstm
+    )
+    zone = (
+        "danger" if risk_score >= WATCH_MAX
+        else "watch" if risk_score >= SAFE_MAX
+        else "safe"
+    )
+
+    return jsonify({
+        "risk_score": round(risk_score, 4),
+        "zone": zone,
+        "model_scores": {
+            "rf": round(p_rf, 4), "xgb": round(p_xgb, 4),
+            "svm": round(p_svm, 4), "lstm": round(p_lstm, 4),
+        },
+        "warmup": warmup,
+        "mode": "ensemble",
+    }), 200
+
+
+@app.route("/health", methods=["GET"])
+def health():
+    return jsonify({
+        "status": "ok",
+        "mode": "ensemble" if MODELS is not None else "heuristic",
+    }), 200
+
+
+if __name__ == "__main__":
+    # 127.0.0.1 only -- never bind 0.0.0.0 here. This server is meant
+    # to be reachable exclusively by n8n on the same machine; the
+    # public-facing tunnel in Phase 4 fronts n8n, not this process.
+    app.run(host="127.0.0.1", port=5000)
