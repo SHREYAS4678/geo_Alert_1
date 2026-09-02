@@ -6,14 +6,14 @@ college demo (or deploy free on Render/PythonAnywhere's free tier later),
 SQLite needs no hosted database, and the only paid-capable dependency
 (Gemini) has a genuinely free tier (see backend/agent.py).
 
-Run:  python app.py          (starts on http://localhost:5000)
+Run:  python app.py         (starts on http://localhost:5000)
 
 Endpoints:
   POST /api/ingest      <- ESP32 posts a sensor reading here
-  GET  /api/latest       -> most recent reading (+ risk) per node
-  GET  /api/history       -> recent readings for charts
-  GET  /api/alerts        -> recent agent alerts
-  POST /api/simulate      -> push a synthetic reading (demo without hardware)
+  GET  /api/latest      -> most recent reading (+ risk) per node
+  GET  /api/history     -> recent readings for charts
+  GET  /api/alerts      -> recent agent alerts
+  POST /api/simulate    -> push a synthetic reading (demo without hardware)
 """
 import os
 import sys
@@ -34,7 +34,7 @@ db.init_db()
 # (vibration_events_3h, tilt_delta_3h, soil_trend_3h) are computed here from
 # history rather than sent by the ESP32, so the firmware only ever has to
 # transmit instantaneous sensor values.
-def build_feature_row(node_id: str, raw: dict) -> dict:
+def build_feature_row(node_id: str, raw: dict) -> tuple:
     history = db.recent_readings(node_id, hours=3.0, limit=50)
     vib_3h = raw["vibration_events_10min"] + sum(
         (h["vibration_events_10min"] or 0) for h in history)
